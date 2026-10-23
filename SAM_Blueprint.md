@@ -216,17 +216,55 @@ func SendWakeOnLAN(broadcastAddr, macStr string) error {
 }
 ```
 
-#### IoT ESP32 Trigger (`internal/network/iot.go`):
+#### IoT ESP32 Client (`internal/network/iot.go`):
 ```go
 package network
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 )
 
+type ESP32SensorData struct {
+	Temperature   float64 `json:"temperature"`
+	Humidity      float64 `json:"humidity"`
+	Status        string  `json:"status"`
+	UptimeSeconds int64   `json:"uptime_seconds"`
+}
+
+// GetESP32Temperature membaca sensor DHT22 melalui endpoint GET /temp
+func GetESP32Temperature(ip string) (*ESP32SensorData, error) {
+	url := fmt.Sprintf("http://%s/temp", ip)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gagal request suhu ke ESP32 (%s): %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ESP32 merespons dengan status: %d", resp.StatusCode)
+	}
+
+	var data ESP32SensorData
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("gagal decode response suhu ESP32: %w", err)
+	}
+
+	return &data, nil
+}
+
+// TriggerESP32AC mengirim sinyal aktivasi AC melalui endpoint GET /ac-on
 func TriggerESP32AC(ip string) error {
 	url := fmt.Sprintf("http://%s/ac-on", ip)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -239,12 +277,12 @@ func TriggerESP32AC(ip string) error {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("gagal request ke ESP32 (%s): %w", url, err)
+		return fmt.Errorf("gagal trigger AC ke ESP32 (%s): %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("ESP32 merespons dengan status code: %d", resp.StatusCode)
+		return fmt.Errorf("ESP32 merespons error status: %d", resp.StatusCode)
 	}
 
 	return nil
@@ -392,16 +430,26 @@ func (h *HomeHandler) Execute(s *discordgo.Session, m *discordgo.MessageCreate, 
 			log.Printf("[ERR] WoL gagal: %v", wolErr)
 		}
 
-		// 2. Tembak ESP32 AC
+		// 2. Baca Suhu Kamar dari DHT22 ESP32 (GET /temp)
+		sensorData, sensorErr := network.GetESP32Temperature(h.cfg.ESP32IP)
+		roomTempInfo := "Data suhu tidak tersedia"
+		if sensorErr == nil {
+			roomTempInfo = fmt.Sprintf("%.1f°C (Kelembapan: %.1f%%)", sensorData.Temperature, sensorData.Humidity)
+			log.Printf("[INFO] Suhu ruangan saat ini: %s", roomTempInfo)
+		} else {
+			log.Printf("[WARN] Gagal membaca suhu ESP32: %v", sensorErr)
+		}
+
+		// 3. Tembak ESP32 AC (GET /ac-on)
 		espErr := network.TriggerESP32AC(h.cfg.ESP32IP)
 		if espErr != nil {
 			log.Printf("[ERR] ESP32 AC gagal: %v", espErr)
 		}
 
 		// Feedback ke Discord setelah dieksekusi
-		statusText := "✅ **Protokol Kedatangan Selesai Dieksekusi!**\n- PC: Magic Packet WoL terkirim\n- AC: Perintah dinyalakan ke ESP32"
+		statusText := fmt.Sprintf("✅ **Protokol Kedatangan Selesai Dieksekusi!**\n- 🖥️ **PC**: Magic Packet WoL terkirim\n- 🌡️ **Suhu Kamar**: %s\n- ❄️ **AC**: Sinyal dinyalakan ke ESP32", roomTempInfo)
 		if wolErr != nil || espErr != nil {
-			statusText = fmt.Sprintf("⚠️ **Protokol selesai dengan beberapa kendala:**\n- WoL: %v\n- AC: %v", wolErr, espErr)
+			statusText = fmt.Sprintf("⚠️ **Protokol selesai dengan beberapa kendala:**\n- WoL: %v\n- Suhu: %s\n- AC: %v", wolErr, roomTempInfo, espErr)
 		}
 		s.ChannelMessageSend(channelID, statusText)
 	}(delayMinutes, m.ChannelID)
